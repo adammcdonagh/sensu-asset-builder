@@ -11,6 +11,7 @@ Here's an example of the `assets.json`. It contains an array of assets to be pac
   "assets": [
     {
       "name": "linux_os_metrics",
+      "type": "python",
       "source_repo": "github.com/adammcdonagh/sensu-assets",
       "source_repo_root_dir": "src/python"
     }
