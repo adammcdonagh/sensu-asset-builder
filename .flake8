@@ -1,0 +1,6 @@
+[flake8]
+ignore = F405,F403,E501
+extend-ignore = W503
+exclude =
+  .venv,
+  build/*/bin/*.py

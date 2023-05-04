@@ -1,0 +1,25 @@
+#/usr/bin/env sh
+# type: ignore
+
+# Absolute path to this script. /home/user/bin/foo.sh
+SCRIPT=$(readlink -f $0)
+# Absolute path this script is in. /home/user/bin
+SCRIPTPATH=`dirname $SCRIPT`
+asset_path=$(dirname -- ${SCRIPTPATH})
+
+# Prepend relative library path to PYTHONPATH
+# to ensure modules are found.
+export PYTHONPATH="${asset_path}/lib"
+
+# Split path into just sensu assets directories
+lines=`echo ${PATH} | tr ':' '\n' | grep 'sensu-agent' | grep -v ${asset_path}`
+
+while read package_path; do
+  export "PYTHONPATH=${package_path}/../lib:${package_path}/../libexec/lib:${PYTHONPATH}"
+
+done <<EOF
+$(echo -e "${lines}")
+EOF
+
+program="${0##*/}"
+exec "${asset_path}/libexec/${program}" "$@"
