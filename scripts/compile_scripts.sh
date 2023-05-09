@@ -2,14 +2,11 @@
 
 # This script will run on the container and is responsible for packaging
 # existing python scripts into a compiled executable for that platform/distro
-
-ASSET_NAME=$1
-PACKAGES=$2
+MY_UID=$1
+MY_GID=$2
+ASSET_NAME=$3
+PACKAGES=$4
 PACKAGES=`echo ${PACKAGES} | base64 -d`
-
-# For alpine we need gcc etc installed to compile stuff
-. /etc/os-release
-echo $ID | grep -i alpine >/dev/null && apk add musl-dev libffi gcc linux-headers python3 py3-pip zlib-dev && pip install pyinstaller
 
 # Install any packages required by the python scripts
 if [[ ! -z ${PACKAGES} ]]; then
@@ -35,3 +32,5 @@ done
 
 # Tidy up src directory
 rm -r build *.spec
+# Set ownership for all files created to the user that ran the container
+chown -R ${MY_UID}:${MY_GID} /build/${ASSET_NAME}

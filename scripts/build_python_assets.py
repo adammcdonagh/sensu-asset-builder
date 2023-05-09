@@ -11,11 +11,10 @@ import platform
 import re
 import shutil
 import sys
+import tempfile
 
-import pygit2
 import requests
 import yaml
-from ghapi.all import GhApi
 from jsmin import jsmin
 
 SCRIPT_VERSION = "1.0"
@@ -27,15 +26,20 @@ SCRIPT_VERSION = "1.0"
 # This script is responsible for building asset packages and generating the SHA512 sum, and a templated
 # yml file for importing into Sensu
 # The output can then be uploaded to a "bonsai" repo ready for Sensu to pull down
-TMP_DIR = "/tmp/sensu-asset-builder"
-BONSAI_PROTOCOL = os.getenv("BONSAI_PROTOCOL")
-BONSAI_HOST = os.getenv("BONSAI_HOST")
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-PYTHON_RUNTIME_REPO = os.getenv("PYTHON_RUNTIME_REPO")
 BUF_SIZE = 65536
+# Get the current user UID and GID
+UID = os.getuid()
+GID = os.getgid()
+tmp_dir = "/tmp/sensu-asset-builder"
 
 
 def main() -> int:
+    bonsai_protocol = os.getenv("BONSAI_PROTOCOL")
+    bonsai_host = os.getenv("BONSAI_HOST")
+    python_runtime_repo = os.getenv("PYTHON_RUNTIME_REPO")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", help="verbose mode", action="store_true")
     parser.add_argument(
@@ -45,8 +49,36 @@ def main() -> int:
         required=False,
         default="assets.json",
     )
+
+    # Allow assets to be tested after they're built. The assets must have all been built previously for this to work
+    parser.add_argument(
+        "-t",
+        "--test",
+        help="Test assets after they're built",
+        required=False,
+        action="store_true",
+    )
+
+    # Allow bonsai_protocol and bonsai_host to be overridden
+    parser.add_argument("-p", "--protocol", help="Bonsai protocol", required=False)
+    parser.add_argument("-s", "--host", help="Bonsai host", required=False)
+
+    # Same for python_runtime_repo
+    parser.add_argument(
+        "-r", "--python-runtime-repo", help="Python runtime repo", required=False
+    )
+
     parser.add_argument("-a", "--asset", help="build a specific asset", required=False)
     args = parser.parse_args()
+
+    # Set the values for the Bonsai protocol and host
+    if args.protocol:
+        bonsai_protocol = args.protocol
+    if args.host:
+        bonsai_host = args.host
+
+    if args.python_runtime_repo:
+        python_runtime_repo = args.python_runtime_repo
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -55,19 +87,19 @@ def main() -> int:
     build_dir = f"{start_dir}/../build"
     assets_dir = f"{start_dir}/../assets"
 
-    # Make sure the TMP_DIR is empty
-    shutil.rmtree(TMP_DIR, ignore_errors=True)
+    # Make sure the tmp_dir is empty
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     this_os = platform.uname().system
     architecture = platform.uname().machine
     logging.debug(f"Local architecture is {architecture}")
 
-    # if not BONSAI_PROTOCOL:
-    #     logging.error("No BONSAI_PROTOCOL specified in environment")
+    # if not bonsai_protocol:
+    #     logging.error("No bonsai_protocol specified in environment")
     #     return 1
 
-    # if not BONSAI_HOST:
-    #     logging.error("No BONSAI_HOST specified in environment")
+    # if not bonsai_host:
+    #     logging.error("No bonsai_host specified in environment")
     #     return 1
 
     # Check that the github cli is installed, if a GITHUB_TOKEN is not set
@@ -78,8 +110,6 @@ def main() -> int:
     if not os.environ.get("GITHUB_TOKEN"):
         # Use the github cli to pull the token to use to API calls
         os.environ["GITHUB_TOKEN"] = os.popen("gh auth token").read().strip()
-
-    gh = GhApi(authenticate=True, token=os.environ.get("GITHUB_TOKEN"))
 
     # Handle MacOS M1
     if this_os == "macOS" and architecture == "arm64":
@@ -100,11 +130,12 @@ def main() -> int:
     required_repos = []
 
     # Loop through each asset in the config and determine which assets need building
+    new_assets = asset_config["assets"].copy()
     for asset in asset_config["assets"]:
         # If we are building a specific asset, skip all others
         if args.asset and not args.asset == asset["name"]:
             # Remove it from the config so we don't have to check again
-            asset_config["assets"].remove(asset)
+            new_assets.remove(asset)
             continue
 
         logging.info(f"{BColours.HEADER}Processing {asset['name']}{BColours.ENDC}")
@@ -114,11 +145,13 @@ def main() -> int:
         if repo not in required_repos:
             required_repos.append(repo)
 
+    asset_config["assets"] = new_assets
+
     # Loop through each repo and clone it
     for repo in required_repos:
         logging.info(f"Cloning {repo}")
-        # Clone the repo into the TMP_DIR
-        os.system(f"gh repo clone {repo} {TMP_DIR}/{repo.split('/')[-1]}")
+        # Clone the repo into the tmp_dir
+        os.system(f"gh repo clone {repo} {tmp_dir}/{repo.split('/')[-1]}")
 
     # Create a requests Session object
     session = requests.Session()
@@ -131,7 +164,7 @@ def main() -> int:
     for asset in asset_config["assets"]:
         asset_name = asset["name"]
         logging.info(f"{BColours.OKCYAN}Processing asset {asset_name}{BColours.ENDC}")
-        asset_root_dir = f"{TMP_DIR}/{asset['source_repo'].split('/')[-1]}/{asset['source_repo_root_dir']}/{asset_name}"
+        asset_root_dir = f"{tmp_dir}/{asset['source_repo'].split('/')[-1]}/{asset['source_repo_root_dir']}/{asset_name}"
 
         # Open the asset_metadata.json file and open it
         asset_metadata = None
@@ -150,9 +183,19 @@ def main() -> int:
         asset_version = asset_metadata["version"]
         requirements = asset_metadata["requirements"]
         python_version = asset_metadata["python_version"]
+        expected_runtime = asset_metadata["runtime"]
 
         for system in asset_metadata["systems"]:
-            logging.info(f"Processing build for {system}")
+            build_message = ""
+            if "platform_family" in system:
+                build_message = system["platform_family"]
+
+                if "platform_version" in system:
+                    build_message = f"{build_message} - {system['platform_version']}"
+            else:
+                build_message = system["os"]
+
+            logging.info(f"Processing build for {build_message}")
             # Create the structure for the asset based on the build_structure template directory
             shutil.rmtree(f"{build_dir}/{asset_name}", ignore_errors=True)
             shutil.copytree(
@@ -208,93 +251,122 @@ def main() -> int:
             elif platform_family == "rhel":
                 docker_image = "almalinux"
                 asset_file_platform_family = "rhel8"
+            elif platform_family == "alpine":
+                docker_image = "alpine"
+                asset_file_platform_family = "alpine"
+
+            # We need to loop through each platform, use the python runtime assets as a runtime to
+            # trigger pip to download the assets we need. Package them up and place them under the lib directory
+            # of this asset
+
+            docker_platform = ""
+            if system["arch"] != architecture:
+                docker_platform = f"--platform linux/{system['arch']}"
+
+            # for M1, if we've been using x86 platforms, we need to specify to use the ARM platform if that's what we are
+            # building for so that the right image actually gets used, otherwise it might use an x86 image that was previously
+            # downloaded
+            if architecture == "aarch64" and system["arch"] == "aarch64":
+                docker_platform = "--platform linux/arm64/v8"
+
+            custom_docker_image_name = (
+                f"asset-builder-{docker_image.replace(':', '_')}-{system['arch']}"
+            )
+
+            # If it doesn't already exit, build a docker image that we can reuse for further asset builds on this platform
+            # Check if the docker image already exists
+
+            if (
+                os.system(f"docker image ls | grep {custom_docker_image_name}") != 0
+                and not args.test
+            ):
+                logging.info(f"Building docker image for {docker_image}")
+                rc = os.system(
+                    f"docker buildx build {docker_platform} -t {custom_docker_image_name} -f {start_dir}/../docker/{docker_image}/Dockerfile {start_dir}/../docker/{docker_image}"
+                )
+                # Check the build worked
+                if rc != 0:
+                    logging.error(
+                        f"Failed to build docker image for {docker_image} - Aborting"
+                    )
+                    return 1
+
+            # Download assets linked to the python runtime repo
+            # Use the gh CLI to list the assets for the latest release
+            if not python_runtime_repo:
+                logging.error("python_runtime_repo is not defined in the environment")
+                return 1
+            runtime_repo_owner = python_runtime_repo.split("/")[0]
+            runtime_repo_name = python_runtime_repo.split("/")[1]
+
+            response = session.get(
+                f"https://api.github.com/repos/{runtime_repo_owner}/{runtime_repo_name}/releases"
+            )
+            if response.status_code != 200:
+                logging.error(
+                    "Error returned from GitHub when trying to obtain Python runtime"
+                )
+                return 1
+
+            response_json = json.loads(response.content)
+
+            # sensu-python-runtime_local-build_python-3.9.10_vanilla-alpine_linux_x86_64.tar.gz
+            obtained_runtime = False
+            for release in response_json:
+                # convert platform_family into short name used in files
+                this_platform = None
+                if platform_family == "rhel":
+                    this_platform = f"rhel{system['platform_version']}"
+                elif platform_family == "amazonlinux":
+                    this_platform = "amzn2"
+                elif platform_family == "alpine":
+                    this_platform = "alpine"
+
+                for release_asset in release["assets"]:
+                    arch = system["arch"]
+                    if arch == "amd64":
+                        arch = "x86_64"
+                    regex = f"sensu-python-runtime.*python-{python_version}_{expected_runtime}-{this_platform}_linux_{arch}"
+
+                    # sensu-python-runtime_v1.1_python-3.9.10_vanilla-alpine_linux_aarch64.tar.gz
+                    if re.search(regex, release_asset["name"]):
+                        logging.info(
+                            f"{BColours.OKGREEN}Found {expected_runtime} build for Python {python_version}{BColours.ENDC}"
+                        )
+                        # Check if the file already exists locally
+                        python_runtime_path = f"{build_dir}/{release_asset['name']}"
+                        # Update the json object with the name of the file we have downloaded
+                        system["runtime_file"] = release_asset["name"]
+
+                        # Check if it exists and isnt 0 size
+                        if (
+                            os.path.exists(python_runtime_path)
+                            and os.path.getsize(python_runtime_path) > 0
+                        ):
+                            logging.info("Already have a copy of the runtime")
+                            obtained_runtime = True
+                            continue
+
+                        # Download the runtime locally
+                        with open(python_runtime_path, "wb") as file:
+                            logging.info(f"Downloading {release_asset['url']}")
+                            response = session.get(
+                                release_asset["url"],
+                                headers={"Accept": "application/octet-stream"},
+                            )
+                            file.write(response.content)
+                            obtained_runtime = True
+
+            if not obtained_runtime:
+                logging.error(
+                    f"{BColours.FAIL}Unable to obtain Python runtime for {python_version}{BColours.ENDC}"
+                )
+                sys.exit(1)
 
             # Now the structure is in place, see if there are any requirements to install
-            if (
-                True
-                or requirements
-                or ("is_compiled" in asset_metadata and asset_metadata["is_compiled"])
+            if requirements or (
+                "is_compiled" in asset_metadata and asset_metadata["is_compiled"]
             ):
-                # We need to loop through each platform, use the python runtime assets as a runtime to
-                # trigger pip to download the assets we need. Package them up and place them under the lib directory
-                # of this asset
-
-                # Download assets linked to the python runtime repo
-                # Use the gh CLI to list the assets for the latest release
-                if not PYTHON_RUNTIME_REPO:
-                    logging.error(
-                        "PYTHON_RUNTIME_REPO is not defined in the environment"
-                    )
-                    return 1
-                runtime_repo_owner = PYTHON_RUNTIME_REPO.split("/")[0]
-                runtime_repo_name = PYTHON_RUNTIME_REPO.split("/")[1]
-
-                response = session.get(
-                    f"https://api.github.com/repos/{runtime_repo_owner}/{runtime_repo_name}/releases"
-                )
-                if response.status_code != 200:
-                    logging.error(
-                        "Error returned from GitHub when trying to obtain Python runtime"
-                    )
-                    return 1
-
-                response_json = json.loads(response.content)
-
-                # sensu-python-runtime_local-build_python-3.9.10_vanilla-alpine_linux_x86_64.tar.gz
-                obtained_runtime = False
-                for release in response_json:
-                    # convert platform_family into short name used in files
-                    this_platform = None
-                    if platform_family == "rhel":
-                        this_platform = f"rhel{system['platform_version']}"
-                    elif platform_family == "amazonlinux":
-                        this_platform = "amzn2"
-                    elif platform_family == "alpine":
-                        this_platform = "alpine"
-
-                    for release_asset in release["assets"]:
-                        ## Pull the release_asset with requests, so we have SSL support (so pip works)
-                        # TEMP:  Try getting the vanilla release first (just to see if it works)
-                        arch = system["arch"]
-                        if arch == "amd64":
-                            arch = "x86_64"
-                        regex = f"sensu-python-runtime.*python-{python_version}_vanilla-{this_platform}_linux_{arch}"
-
-                        # sensu-python-runtime_v1.1_python-3.9.10_vanilla-alpine_linux_aarch64.tar.gz
-                        if re.search(regex, release_asset["name"]):
-                            logging.info(
-                                f"{BColours.OKGREEN}Found vanilla build for Python {python_version}{BColours.ENDC}"
-                            )
-                            # Check if the file already exists locally
-                            python_runtime_path = f"{build_dir}/{release_asset['name']}"
-                            # Update the json object with the name of the file we have downloaded
-                            system["runtime_file"] = release_asset["name"]
-
-                            # Check if it exists and isnt 0 size
-                            if (
-                                os.path.exists(python_runtime_path)
-                                and os.path.getsize(python_runtime_path) > 0
-                            ):
-                                logging.info("Already have a copy of the runtime")
-                                obtained_runtime = True
-                                continue
-
-                            # Download the runtime locally
-                            with open(python_runtime_path, "wb") as file:
-                                logging.info(f"Downloading {release_asset['url']}")
-                                response = session.get(
-                                    release_asset["url"],
-                                    headers={"Accept": "application/octet-stream"},
-                                )
-                                file.write(response.content)
-                                obtained_runtime = True
-
-                if not obtained_runtime:
-                    logging.error(
-                        f"{BColours.FAIL}Unable to obtain Python runtime for {python_version}{BColours.ENDC}"
-                    )
-                    sys.exit(1)
-
                 # At this point we've got a file for each platform that we should need
                 # Now we need to spin up a container for each system and download the pip package that we want
                 # Get the name of the container that we need from the platform name
@@ -302,19 +374,6 @@ def main() -> int:
                 logging.info(
                     f"Getting packages for {platform_family}:{platform_version}"
                 )
-
-                docker_platform = ""
-                if system["arch"] != architecture:
-                    docker_platform = f"--platform linux/{system['arch']}"
-
-                # for M1, if we've been using x86 platforms, we need to specify to use the ARM platform if that's what we are
-                # building for so that the right image actually gets used, otherwise it might use an x86 image that was previously
-                # downloaded
-                if architecture == "aarch64" and system["arch"] == "aarch64":
-                    docker_platform = "--platform linux/arm64/v8"
-
-                # Set the docker image if this is rhel
-                docker_image = platform_family
 
                 # Determine the runtime dir
                 runtime_dir = (
@@ -336,7 +395,7 @@ def main() -> int:
                     "is_compiled" not in asset_metadata
                     or not asset_metadata["is_compiled"]
                 ):
-                    docker_command = f"docker run {docker_platform} --rm -v {build_dir}:/build -v {start_dir}:/src -v {runtime_dir}:/runtime {docker_image} sh /src/download_requirements.sh /build/{system['runtime_file']} {asset_name} {packages}"
+                    docker_command = f"docker run {docker_platform} --rm -v {build_dir}:/build -v {start_dir}:/scripts -v {asset_root_dir}:/src -v {runtime_dir}:/runtime {custom_docker_image_name} sh /scripts/download_requirements.sh {UID} {GID} {asset_name} {packages}"
                     logging.info(f"Running: {docker_command}")
                     rc = os.system(docker_command)
                     if rc != 0:
@@ -344,9 +403,13 @@ def main() -> int:
                             f"{BColours.FAIL}Bundle of package for {platform_family} failed{BColours.ENDC}"
                         )
                         return 1
+                    else:
+                        logging.info(
+                            f"{BColours.OKGREEN}Bundle of package for {platform_family} succeeded{BColours.ENDC}"
+                        )
                 else:
                     # Compile the scripts into a binary
-                    docker_command = f"docker run {docker_platform} --rm -v {build_dir}:/build -v {start_dir}:/src -v {runtime_dir}:/runtime {docker_image} sh /src/compile_scripts.sh {asset_name} {packages}"
+                    docker_command = f"docker run {docker_platform} --rm -v {build_dir}:/build -v {start_dir}:/scripts -v {asset_root_dir}:/src -v {runtime_dir}:/runtime {docker_image} sh /scripts/compile_scripts.sh {UID} {GID} {asset_name} {packages}"
                     logging.info(f"Running: {docker_command}")
                     rc = os.system(docker_command)
                     if rc != 0:
@@ -354,87 +417,178 @@ def main() -> int:
                             f"{BColours.FAIL}Compile of scripts for {platform_family} failed{BColours.ENDC}"
                         )
                         return 1
+                    else:
+                        logging.info(
+                            f"{BColours.OKGREEN}Compile for {platform_family} succeeded{BColours.ENDC}"
+                        )
 
             # Second last step is to tar the asset and generate the sha512 sum for it
             asset_output_file = f"{assets_dir}/{asset_name}_{asset_version}_{asset_file_platform_family + '_' if asset_file_platform_family else ''}{system['os']}_{system['arch']}.tar.gz"
-            tar_command = f"tar czf {asset_output_file} -C {build_dir}/{asset_name} ./"
-            rc = os.system(tar_command)
 
-            if rc != 0:
-                logging.error(f"{BColours.FAIL}Tar of assets failed{BColours.ENDC}")
-                return 1
+            if not args.test:
+                tar_command = (
+                    f"tar czf {asset_output_file} -C {build_dir}/{asset_name} ./"
+                )
+                logging.debug(f"Running: {tar_command}")
+                rc = os.system(tar_command)
 
-            # Generate the sha512 sum
-            sha512 = hashlib.sha512()
-            with open(asset_output_file, "rb") as f:
-                while True:
-                    data = f.read(BUF_SIZE)
-                    if not data:
-                        break
-                    sha512.update(data)
+                if rc != 0:
+                    logging.error(f"{BColours.FAIL}Tar of assets failed{BColours.ENDC}")
+                    return 1
 
-            print(f"SHA512: {sha512.hexdigest()}")
-            # Update the object with the asset name and sha512 sum
-            system["asset_output_file"] = asset_output_file
-            system["sha512sum"] = sha512.hexdigest()
+                # Generate the sha512 sum
+                sha512 = hashlib.sha512()
+                with open(asset_output_file, "rb") as f:
+                    while True:
+                        data = f.read(BUF_SIZE)
+                        if not data:
+                            break
+                        sha512.update(data)
+
+                print(f"SHA512: {sha512.hexdigest()}")
+                # Update the object with the asset name and sha512 sum
+                system["asset_output_file"] = asset_output_file
+                system["sha512sum"] = sha512.hexdigest()
+
+            # This is where we test the assets work
+            if args.test and "test_command" in asset_metadata:
+                assets = []
+                # Add the asset_output_file to the assets array
+                assets.append({"name": asset_name, "path": asset_output_file})
+                # Determine if the asset has any other asset dependencies
+                if "requires_assets" in asset_metadata:
+                    for required_asset in asset_metadata["requires_assets"]:
+                        # Loop through the contents of the assets directory to find the latest verion of the required asset (stripping off any xxxx/ from the front of the asset name)
+                        required_asset_name = required_asset.split("/")[-1]
+
+                        # Find files that look like the ones we need
+                        potential_asset_files = []
+                        for x in os.listdir(assets_dir):
+                            if x.startswith(required_asset_name) and x.endswith(
+                                f"{asset_file_platform_family + '_' if asset_file_platform_family else ''}{system['os']}_{system['arch']}.tar.gz"
+                            ):
+                                potential_asset_files.append(
+                                    {"name": required_asset_name, "path": x}
+                                )
+
+                        versions = [
+                            float(
+                                x["path"]
+                                .split(system["platform_family"])[0]
+                                .split("_")[-2]
+                            )
+                            for x in potential_asset_files
+                        ]
+                        if not versions:
+                            logging.error(
+                                f"Unable to find asset dependency: {required_asset_name}"
+                            )
+                            return 1
+                        required_asset_version = max(versions)
+                        # From the potential_asset_files, find the one with this versio number
+                        required_asset_file = [
+                            f"{assets_dir}/{x['path']}"
+                            for x in potential_asset_files
+                            if str(required_asset_version) in x["path"]
+                        ][0]
+
+                        logging.info(
+                            f"Found asset dependency: {required_asset_name}_{required_asset_version}"
+                        )
+                        assets.append(
+                            {"name": required_asset_name, "path": required_asset_file}
+                        )
+                # Create a temporary directory, and extract both assets to it
+                temp_dir = tempfile.mkdtemp()
+
+                # We also need the runtime
+                assets.append({"name": "runtime", "path": python_runtime_path})
+                # For each asset in the assets array, extract them to the temp_dir
+                for asset in assets:
+                    logging.info(f"Extracting {asset['path']} to {temp_dir}")
+                    os.system(
+                        f"mkdir {temp_dir}/{asset['name']} && tar xzf {asset['path']} -C {temp_dir}/{asset['name']}"
+                    )
+
+                #  Now we can test in a docker container
+                docker_command = f"docker run --rm -v {temp_dir}:/var/cache/sensu-agent -v {start_dir}:/scripts {docker_image} sh /scripts/test_script.sh \"{asset_metadata['test_command']}\""
+                logging.info(f"Running: {docker_command}")
+
+                rc = os.system(docker_command)
+                # Run the test command
+                if rc != 0:
+                    logging.error(
+                        f"{BColours.FAIL}Test of scripts for {asset_name} - {platform_family} failed{BColours.ENDC}"
+                    )
+                    return 1
+                else:
+                    logging.info(
+                        f"{BColours.OKGREEN}Test of scripts for {asset_name} - {platform_family} succeeded{BColours.ENDC}"
+                    )
+
+                shutil.rmtree(temp_dir)
 
         # Create the asset YML file
-        asset_yml = dict()
-        asset_yml["type"] = "Asset"
-        asset_yml["api_version"] = "core/v2"
-        asset_yml["metadata"] = dict()
-        asset_yml["metadata"]["name"] = f"{asset_name}_v{asset_version}"
+        if not args.test:
+            asset_yml = dict()
+            asset_yml["type"] = "Asset"
+            asset_yml["api_version"] = "core/v2"
+            asset_yml["metadata"] = dict()
+            asset_yml["metadata"]["name"] = f"{asset_sensu_name}_v{asset_version}"
 
-        asset_yml["spec"] = dict()
-        asset_yml["spec"]["builds"] = []
+            asset_yml["spec"] = dict()
+            asset_yml["spec"]["builds"] = []
 
-        # Create the builds array
-        for system in asset_metadata["systems"]:
-            # Check that we had a successful build, otherwise skip it (maybe it was for M1 or something)
-            if "sha512sum" not in system:
-                continue
-            system_specific_asset_definition = {
-                "sha512": system["sha512sum"],
-                "url": f"{BONSAI_PROTOCOL}://{BONSAI_HOST}/{os.path.basename(system['asset_output_file'])}",
-            }
+            # Create the builds array
+            for system in asset_metadata["systems"]:
+                # Check that we had a successful build, otherwise skip it (maybe it was for M1 or something)
+                if "sha512sum" not in system:
+                    continue
 
-            filters = []
+                bonsai_url = (
+                    f"{bonsai_protocol}://{bonsai_host}/{os.path.basename(system['asset_output_file'])}"
+                    if bonsai_protocol
+                    else f"{{{{URL_TOKEN}}}}/{os.path.basename(system['asset_output_file'])}"
+                )
+                system_specific_asset_definition = {
+                    "sha512": system["sha512sum"],
+                    "url": bonsai_url,
+                }
 
-            # Add the conditions
-            for filter in system["sensu_filters"]:
-                filters.append(filter)
+                filters = []
 
-            system_specific_asset_definition["filters"] = filters
+                # Add the conditions
+                for filter in system["sensu_filters"]:
+                    filters.append(filter)
 
-            asset_yml["spec"]["builds"].append(system_specific_asset_definition)
+                system_specific_asset_definition["filters"] = filters
 
-        # Write the asset yml along with the asset
-        asset_build_dir = f"{build_dir}/{asset_name}"
-        if not os.path.exists(asset_build_dir):
-            os.makedirs(asset_build_dir)
+                asset_yml["spec"]["builds"].append(system_specific_asset_definition)
 
-        with open(f"{asset_build_dir}/asset.yml", "w") as yml_file:
-            yaml.dump(
-                asset_yml,
-                yml_file,
-                default_flow_style=False,
-                sort_keys=False,
-                explicit_start=True,
-            )
-            logging.info(
+            with open(
+                f"{assets_dir}/{asset_name}-asset-definition.yml", "w"
+            ) as yml_file:
                 yaml.dump(
                     asset_yml,
+                    yml_file,
                     default_flow_style=False,
                     sort_keys=False,
                     explicit_start=True,
                 )
-            )
+                logging.info(
+                    yaml.dump(
+                        asset_yml,
+                        default_flow_style=False,
+                        sort_keys=False,
+                        explicit_start=True,
+                    )
+                )
 
-        # Tidy up the build dir
-        shutil.rmtree(f"{build_dir}/{asset_name}", ignore_errors=True)
-        logging.info(
-            f"{BColours.OKGREEN}Successfully built asset: {asset_name}{BColours.ENDC}"
-        )
+            # Tidy up the build dir
+            shutil.rmtree(f"{build_dir}/{asset_name}", ignore_errors=True)
+            logging.info(
+                f"{BColours.OKGREEN}Successfully built asset: {asset_sensu_name}{BColours.ENDC}"
+            )
 
     return 0
 
@@ -454,6 +608,6 @@ class BColours:
 logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
 rc = main()
 # Tidy up the temporary directory
-shutil.rmtree(TMP_DIR, ignore_errors=True)
+shutil.rmtree(tmp_dir, ignore_errors=True)
 
 sys.exit(rc)

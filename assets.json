@@ -5,20 +5,25 @@
       "type": "python",
       "source_repo": "adammcdonagh/sensu-assets",
       "source_repo_root_dir": "src/python"
+    },
+    {
+      "name": "example_asset",
+      "type": "python",
+      "source_repo": "adammcdonagh/sensu-assets",
+      "source_repo_root_dir": "src/python"
+    },
+    {
+      "name": "sensu_plugin",
+      "type": "python",
+      "source_repo": "adammcdonagh/sensu-assets",
+      "source_repo_root_dir": "src/python"
+    },
+    {
+      "name": "handler_sqs",
+      "type": "python",
+      "source_repo": "adammcdonagh/sensu-assets",
+      "source_repo_root_dir": "src/python"
     }
-    // },
-    // {
-    //   "name": "example_asset",
-    //   "type": "python",
-    //   "source_repo": "adammcdonagh/sensu-assets",
-    //   "source_repo_root_dir": "src/python"
-    // },
-    // {
-    //   "name": "sensu_plugin",
-    //   "type": "python",
-    //   "source_repo": "adammcdonagh/sensu-assets",
-    //   "source_repo_root_dir": "src/python"
-    // }
   ],
   "destination": {
     "type": "s3",

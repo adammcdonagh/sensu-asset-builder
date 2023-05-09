@@ -10,7 +10,10 @@
       "request": "launch",
       "program": "scripts/build_python_assets.py",
       "args": [
-        "-v"
+        "-v",
+        "-a",
+        "linux_os_metrics",
+        "-t"
       ],
       "console": "integratedTerminal",
       "justMyCode": true,
